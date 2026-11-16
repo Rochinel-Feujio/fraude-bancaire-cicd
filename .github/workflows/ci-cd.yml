@@ -1,0 +1,121 @@
+name: CI/CD - Détection de fraude bancaire
+
+# Déclenché sur chaque push et pull request vers main.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+
+  # -----------------------------------------------------------------------
+  # 1) INTÉGRATION CONTINUE (CI) — Développement
+  #    À chaque push : installation, génération des données, entraînement,
+  #    puis tests unitaires + test de non-régression du F1-score.
+  #    Si un test échoue, le pipeline s'arrête ici : rien n'est déployé.
+  # -----------------------------------------------------------------------
+  integration:
+    name: "1. Intégration continue (build & tests)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installation des dépendances
+        run: pip install -r requirements.txt
+
+      - name: Génération du jeu de données
+        run: python3 data/generate_data.py
+
+      - name: Tests unitaires + test de non-régression du modèle (precision/recall/F1)
+        run: python3 -m pytest tests/test_preprocessing.py tests/test_model_performance.py -v
+
+      - name: Entraînement du modèle (artefact pour les étapes suivantes)
+        run: python3 src/train.py
+
+      - name: Sauvegarde des artefacts (modèle, scaler, métriques, données)
+        uses: actions/upload-artifact@v4
+        with:
+          name: modele-entraine
+          path: |
+            models/
+            data/transactions.csv
+
+  # -----------------------------------------------------------------------
+  # 2) RECETTE (UAT) — Validation métier avant mise en production
+  #    On relance l'API avec le modèle entraîné et on exécute des scénarios
+  #    concrets (transaction à risque / transaction normale) pour vérifier
+  #    que le comportement correspond à ce qu'attend le métier.
+  #    Ne se déclenche que sur push vers main (pas sur les pull requests).
+  # -----------------------------------------------------------------------
+  recette:
+    name: "2. Recette (tests d'acceptation sur l'API)"
+    needs: integration
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installation des dépendances
+        run: pip install -r requirements.txt
+
+      - name: Récupération du modèle entraîné (étape précédente)
+        uses: actions/download-artifact@v4
+        with:
+          name: modele-entraine
+
+      - name: Démarrage de l'API de scoring en arrière-plan
+        run: |
+          nohup python3 src/predict.py > api.log 2>&1 &
+          sleep 3
+
+      - name: Exécution des tests de recette (scénarios métier)
+        run: python3 -m pytest tests/test_acceptance.py -v
+
+  # -----------------------------------------------------------------------
+  # 3) MISE EN PRODUCTION (CD)
+  #    Ne se déclenche que si la recette est passée. Construit l'image Docker
+  #    de l'API (modèle inclus) et la publie comme artefact de déploiement.
+  #    Le push vers un vrai registre (Docker Hub, etc.) est indiqué en
+  #    commentaire : il nécessite des identifiants (secrets GitHub) qui ne
+  #    sont pas configurés ici par défaut.
+  # -----------------------------------------------------------------------
+  mise-en-production:
+    name: "3. Mise en production (packaging & déploiement)"
+    needs: recette
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Construction de l'image Docker (modèle + API)
+        run: docker build -t fraude-bancaire:${{ github.sha }} .
+
+      # Déploiement réel vers un registre — à activer une fois les secrets configurés :
+      #
+      # - name: Connexion au registre
+      #   uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+      #
+      # - name: Publication de l'image
+      #   run: |
+      #     docker tag fraude-bancaire:${{ github.sha }} mon-compte/fraude-bancaire:latest
+      #     docker push mon-compte/fraude-bancaire:latest
+
+      - name: Confirmation
+        run: echo "Image Docker fraude-bancaire:${{ github.sha }} construite — prête à être déployée."
