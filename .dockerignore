@@ -1,0 +1,6 @@
+models/
+data/transactions.csv
+.github/
+__pycache__/
+*.pyc
+.pytest_cache/
